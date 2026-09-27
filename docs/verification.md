@@ -144,7 +144,7 @@ C3 FAIL  n8n webhook fetch() calls live only in lib/n8n/client.*
      app/actions.ts:54
 C4 FAIL  n8n webhook fetch() calls have AbortSignal.timeout(...)
      app/actions.ts:54
-C5 PASS  callback route verifies signature before JSON.parse
+C5 PASS  callback route verifies signature (timingSafeEqual) before JSON.parse
 C6 PASS  no === / !== comparison against a signature/token/secret
 C7 PASS  .env.example N8N secrets use change-me-... placeholders
 
@@ -164,7 +164,7 @@ C1 PASS  no /webhook-test/ URL in code or .env.example
 C2 PASS  no NEXT_PUBLIC_* env var name referencing N8N
 C3 PASS  n8n webhook fetch() calls live only in lib/n8n/client.*
 C4 PASS  n8n webhook fetch() calls have AbortSignal.timeout(...)
-C5 FAIL  callback route verifies signature before JSON.parse
+C5 FAIL  callback route verifies signature (timingSafeEqual) before JSON.parse
      app/api/n8n/[event]/route.ts:2
 C6 FAIL  no === / !== comparison against a signature/token/secret
      app/api/n8n/[event]/route.ts:5
@@ -174,8 +174,20 @@ C7 PASS  .env.example N8N secrets use change-me-... placeholders
 exit=1
 ```
 
-Разом усі 7 перевірок (C1–C7) підтверджено як справжні: п'ять із них ловлять реальні порушення на
-`main`, дві решти — на навмисно поганому коді. Жодна перевірка не є такою, що завжди PASS.
+Разом усі 7 перевірок (C1–C7) підтверджено як справжні: **три з них (C1, C3, C4) ловлять реальні
+порушення на `main`, ще дві (C5, C6) — на навмисно поганому коді** (разом 5 із 7 перевірок побачили
+хоч одне реальне порушення; C2 і C7 на цьому етапі PASS, бо порушувати їм поки нема на чому — немає
+жодної `NEXT_PUBLIC_`-змінної й немає реальних (не-`change-me-`) секретів у `.env.example`). Жодна
+перевірка не є такою, що завжди PASS.
+
+**Незалежна перевірка (не моя) знайшла й виправлено:** початкова версія C3/C4 вимагала URL і
+`fetch(` в одному рядку — і мовчки пропускала виклик, розбитий на кілька рядків (`const url = ...;
+await fetch(url, {...})`); C5 вважав перевірку підпису «побаченою» від самої згадки слова
+«signature» (навіть у коментарі чи при простому читанні заголовка), а не від реального виклику
+`timingSafeEqual`; C6 не ловив camelCase-імена (`expectedSignature !== providedSignature`) через
+зайву вимогу межі слова. Усі три виправлено (перевірено на регресійних прикладах — виявляють
+порушення, які раніше пропускали, — і повторно на `main` та на навмисно поганому коді вище: той
+самий результат, що й до виправлення).
 
 **`check-contract.mjs` на фінальному коді** (після перенесення прогону B — 0 FAIL): ще не
 застосовується — буде заповнено після Task D.

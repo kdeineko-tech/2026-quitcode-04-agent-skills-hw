@@ -122,70 +122,80 @@ function record(id, title, violations) {
   record("C2", "no NEXT_PUBLIC_* env var name referencing N8N", violations);
 }
 
+// Shared helper for C3/C4: a "call site" is a fetch(...) call whose surrounding lines
+// (not necessarily the same line -- the URL is often built a few lines earlier and
+// passed in as a variable) reference an n8n webhook URL or its env vars.
+const N8N_URL_PATTERN = /N8N_WEBHOOK_(BASE_)?URL|\/webhook\//;
+const FETCH_PATTERN = /fetch\s*\(/;
+const CALL_SITE_WINDOW = 8;
+
+function findN8nFetchCallSites(lines) {
+  const urlLines = [];
+  const fetchLines = [];
+  lines.forEach((line, i) => {
+    if (N8N_URL_PATTERN.test(line)) urlLines.push(i);
+    if (FETCH_PATTERN.test(line)) fetchLines.push(i);
+  });
+  return fetchLines.filter((f) => urlLines.some((u) => Math.abs(u - f) <= CALL_SITE_WINDOW));
+}
+
 // C3: n8n webhook calls confined to one server module (a file whose name/path
 // suggests it IS the designated n8n client, e.g. lib/n8n/client.ts, is allowed).
 {
   const violations = [];
-  const callSitePattern = /N8N_WEBHOOK_(BASE_)?URL|\/webhook\//;
   const allowedModule = /(^|\/)lib\/n8n\/client\.(ts|js|mjs)$/;
   for (const file of sourceFiles) {
     if (allowedModule.test(rel(file))) continue;
     const lines = readLines(file);
-    lines.forEach((line, i) => {
-      if (callSitePattern.test(line) && /fetch\s*\(/.test(line)) {
-        violations.push(`${rel(file)}:${i + 1}`);
-      }
-    });
+    for (const i of findN8nFetchCallSites(lines)) violations.push(`${rel(file)}:${i + 1}`);
   }
   record("C3", "n8n webhook fetch() calls live only in lib/n8n/client.*", violations);
 }
 
-// C4: every n8n webhook fetch() call has AbortSignal.timeout nearby (within 5 lines after).
+// C4: every n8n webhook fetch() call has AbortSignal.timeout nearby (either side).
 {
   const violations = [];
-  const callSitePattern = /N8N_WEBHOOK_(BASE_)?URL|\/webhook\//;
   for (const file of sourceFiles) {
     const lines = readLines(file);
-    for (let i = 0; i < lines.length; i++) {
-      if (callSitePattern.test(lines[i]) && /fetch\s*\(/.test(lines[i])) {
-        const window = lines.slice(i, i + 6).join("\n");
-        if (!/AbortSignal\.timeout\s*\(/.test(window)) {
-          violations.push(`${rel(file)}:${i + 1}`);
-        }
-      }
+    for (const i of findN8nFetchCallSites(lines)) {
+      const start = Math.max(0, i - CALL_SITE_WINDOW);
+      const end = Math.min(lines.length, i + CALL_SITE_WINDOW + 1);
+      const window = lines.slice(start, end).join("\n");
+      if (!/AbortSignal\.timeout\s*\(/.test(window)) violations.push(`${rel(file)}:${i + 1}`);
     }
   }
   record("C4", "n8n webhook fetch() calls have AbortSignal.timeout(...)", violations);
 }
 
-// C5: a callback route (path contains api/n8n or filename suggests a webhook callback
-// handler) must not call req.json()/JSON.parse before a signature check appears.
+// C5: a callback route (under app/api/n8n/) must not call req.json()/JSON.parse before
+// an actual signature verification (a real timingSafeEqual(...) call -- not just a
+// mention of "signature", which a comment or a header-read line could trigger).
+// Comment-only lines are ignored on both sides so a stray "// verify signature" note
+// can't be mistaken for the real check.
 {
   const violations = [];
   const routePattern = /(^|\/)app\/api\/n8n\//;
   for (const file of sourceFiles) {
     if (!routePattern.test(rel(file))) continue;
     const lines = readLines(file);
-    let sawParseBeforeSignatureCheck = false;
     let sawSignatureCheck = false;
     lines.forEach((line, i) => {
+      const trimmed = line.trim();
+      if (trimmed.startsWith("//") || trimmed.startsWith("*")) return;
       const isParse = /\.json\(\)|JSON\.parse\(/.test(line);
-      const isSigCheck = /timingSafeEqual|x-n8n-signature|signature/i.test(line);
-      if (isParse && !sawSignatureCheck) {
-        sawParseBeforeSignatureCheck = true;
-        violations.push(`${rel(file)}:${i + 1}`);
-      }
-      if (isSigCheck) sawSignatureCheck = true;
+      if (isParse && !sawSignatureCheck) violations.push(`${rel(file)}:${i + 1}`);
+      if (/timingSafeEqual\s*\(/.test(line)) sawSignatureCheck = true;
     });
-    void sawParseBeforeSignatureCheck;
   }
-  record("C5", "callback route verifies signature before JSON.parse", violations);
+  record("C5", "callback route verifies signature (timingSafeEqual) before JSON.parse", violations);
 }
 
-// C6: no ===/!== comparison against something named signature/token/secret.
+// C6: no ===/!== comparison against something named signature/token/secret, including
+// camelCase identifiers (expectedSignature, providedToken, ...) -- deliberately no word
+// boundary in front of the keyword so a substring match still catches those.
 {
   const violations = [];
-  const pattern = /\b(signature|token|secret)\w*\s*(===|!==)|(===|!==)\s*\w*\b(signature|token|secret)\b/i;
+  const pattern = /(signature|token|secret)\w*\s*(===|!==)|(===|!==)\s*\w*(signature|token|secret)/i;
   for (const file of sourceFiles) {
     const lines = readLines(file);
     lines.forEach((line, i) => {
