@@ -5,6 +5,8 @@ import type {
   LeadStats,
   LeadStatus,
   NewLead,
+  NewQuoteRequest,
+  QuoteRequest,
   SourceCount,
   User,
   Workspace,
@@ -20,6 +22,9 @@ type Store = {
   leads: Lead[];
   audit: AuditEntry[];
   nextLeadNumber: number;
+  quoteRequests: QuoteRequest[];
+  nextQuoteNumber: number;
+  n8nCallbackClaims: Set<string>;
 };
 
 const LATENCY_MS = {
@@ -36,6 +41,13 @@ const LATENCY_MS = {
   insertAuditEntry: 250,
   listUsers: 50,
   createSession: 50,
+  insertQuoteRequest: 120,
+  getQuoteRequest: 80,
+  getQuoteRequestByIdempotencyKey: 80,
+  markQuoteRequestReady: 80,
+  markQuoteRequestFailed: 80,
+  claimCallbackKey: 50,
+  releaseCallbackKey: 50,
 } as const;
 
 type QueryName = keyof typeof LATENCY_MS;
@@ -162,6 +174,10 @@ function leadId(n: number) {
   return `lead_${String(n).padStart(4, "0")}`;
 }
 
+function quoteId(n: number) {
+  return `quote_${String(n).padStart(4, "0")}`;
+}
+
 function seedLeads(count: number, workspaces: Workspace[], users: User[]): Lead[] {
   const random = mulberry32(20260921);
   const pick = <T,>(items: readonly T[]) => items[Math.floor(random() * items.length)];
@@ -262,7 +278,16 @@ function createStore(): Store {
     { id: "u_marta", name: "Marta Novak", email: "marta@brightline.example.test", role: "manager", workspaceSlug: "brightline" },
   ];
   const leads = seedLeads(200, workspaces, users);
-  return { workspaces, users, leads, audit: [], nextLeadNumber: leads.length + 1 };
+  return {
+    workspaces,
+    users,
+    leads,
+    audit: [],
+    nextLeadNumber: leads.length + 1,
+    quoteRequests: [],
+    nextQuoteNumber: 1,
+    n8nCallbackClaims: new Set(),
+  };
 }
 
 // One store per server process (also survives module reloads in `next dev`).
@@ -392,6 +417,73 @@ export const db = {
   insertAuditEntry(entry: AuditEntry) {
     return query("insertAuditEntry", () => {
       store.audit.push(entry);
+    });
+  },
+
+  insertQuoteRequest(input: NewQuoteRequest) {
+    return query("insertQuoteRequest", (): QuoteRequest => {
+      const now = new Date().toISOString();
+      const quote: QuoteRequest = {
+        ...input,
+        id: quoteId(store.nextQuoteNumber++),
+        status: "queued",
+        documentUrl: null,
+        errorCode: null,
+        createdAt: now,
+        updatedAt: now,
+      };
+      store.quoteRequests.push(quote);
+      return structuredClone(quote);
+    });
+  },
+
+  getQuoteRequest(id: string) {
+    return query("getQuoteRequest", () => {
+      const quote = store.quoteRequests.find((q) => q.id === id);
+      return quote ? structuredClone(quote) : null;
+    });
+  },
+
+  getQuoteRequestByIdempotencyKey(idempotencyKey: string) {
+    return query("getQuoteRequestByIdempotencyKey", () => {
+      const quote = store.quoteRequests.find((q) => q.idempotencyKey === idempotencyKey);
+      return quote ? structuredClone(quote) : null;
+    });
+  },
+
+  markQuoteRequestReady(id: string, documentUrl: string) {
+    return query("markQuoteRequestReady", () => {
+      const quote = store.quoteRequests.find((q) => q.id === id);
+      if (!quote) return false;
+      quote.status = "ready";
+      quote.documentUrl = documentUrl;
+      quote.updatedAt = new Date().toISOString();
+      return true;
+    });
+  },
+
+  markQuoteRequestFailed(id: string, errorCode: string) {
+    return query("markQuoteRequestFailed", () => {
+      const quote = store.quoteRequests.find((q) => q.id === id);
+      if (!quote) return false;
+      quote.status = "failed";
+      quote.errorCode = errorCode;
+      quote.updatedAt = new Date().toISOString();
+      return true;
+    });
+  },
+
+  claimCallbackKey(key: string) {
+    return query("claimCallbackKey", () => {
+      if (store.n8nCallbackClaims.has(key)) return false;
+      store.n8nCallbackClaims.add(key);
+      return true;
+    });
+  },
+
+  releaseCallbackKey(key: string) {
+    return query("releaseCallbackKey", () => {
+      store.n8nCallbackClaims.delete(key);
     });
   },
 };

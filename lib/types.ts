@@ -95,6 +95,34 @@ export type SourceCount = {
 
 export type AuditEntry = {
   action: string;
-  leadId: string;
+  entityId: string;
   at: string;
+};
+
+export const QUOTE_STATUSES = ["queued", "ready", "failed"] as const;
+
+export type QuoteStatus = (typeof QUOTE_STATUSES)[number];
+
+export type QuoteRequest = {
+  id: string;
+  company: string;
+  email: string;
+  taskDescription: string;
+  budget: number | null;
+  status: QuoteStatus;
+  idempotencyKey: string;
+  correlationId: string;
+  documentUrl: string | null;
+  errorCode: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type NewQuoteRequest = {
+  company: string;
+  email: string;
+  taskDescription: string;
+  budget: number | null;
+  idempotencyKey: string;
+  correlationId: string;
 };
