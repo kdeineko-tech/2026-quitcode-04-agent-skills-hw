@@ -1,0 +1,885 @@
+diff --git a/.claude/launch.json b/.claude/launch.json
+new file mode 100644
+index 0000000..2b1d62a
+--- /dev/null
++++ b/.claude/launch.json
+@@ -0,0 +1,11 @@
++{
++  "version": "0.0.1",
++  "configurations": [
++    {
++      "name": "leaddesk-dev",
++      "runtimeExecutable": "npm",
++      "runtimeArgs": ["run", "dev"],
++      "port": 3000
++    }
++  ]
++}
+diff --git a/.env.example b/.env.example
+index 26590dc..e165a54 100644
+--- a/.env.example
++++ b/.env.example
+@@ -1,6 +1,16 @@
+ # LeadDesk local settings. Copy this file to .env.local and adjust it there.
+ # .env* files are git-ignored (except this example), so real values never reach git.
+ 
+-# n8n webhook that receives every new lead from the public form.
+-# Locally it points at the offline n8n mock: node tools/mock-n8n.mjs
+-N8N_WEBHOOK_URL=http://127.0.0.1:5678/webhook-test/lead-created
++# Base of the client's published n8n webhooks (must end in /webhook — never the test-listener path).
++# Locally it points at the offline n8n mock: node .claude/skills/integrating-n8n-webhooks/scripts/mock-n8n.mjs
++N8N_WEBHOOK_BASE_URL=http://127.0.0.1:5678/webhook
++
++# Header Auth credential value n8n expects on the x-n8n-token header.
++N8N_WEBHOOK_TOKEN=change-me-webhook-token
++
++# HMAC secret n8n signs callback bodies with (Crypto credential, Hmac Secret).
++# Generate with: node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
++N8N_CALLBACK_SECRET=change-me-callback-secret
++
++# Address n8n uses to reach this app's callback endpoints.
++APP_BASE_URL=http://127.0.0.1:3000
+diff --git a/app/actions.ts b/app/actions.ts
+index a232fa8..7c1da06 100644
+--- a/app/actions.ts
++++ b/app/actions.ts
+@@ -1,5 +1,6 @@
+ "use server";
+ 
++import { randomUUID } from "node:crypto";
+ import { headers } from "next/headers";
+ import { revalidatePath } from "next/cache";
+ import { after } from "next/server";
+@@ -7,6 +8,7 @@ import { db } from "@/lib/db";
+ import { logAudit } from "@/lib/audit";
+ import { getCurrentUser, getLead, getWorkspace } from "@/lib/data";
+ import { parseLeadForm, type LeadFormField } from "@/lib/lead-form";
++import { callWebhook } from "@/lib/n8n/client";
+ import type { LeadStatus } from "@/lib/types";
+ 
+ const PUBLIC_FORM_WORKSPACE_ID = "ws_studio_nova";
+@@ -53,15 +55,26 @@ export async function submitLead(
+     },
+   });
+ 
+-  try {
+-    await fetch(process.env.N8N_WEBHOOK_URL!, {
+-      method: "POST",
+-      headers: { "content-type": "application/json" },
+-      body: JSON.stringify(lead),
+-    });
+-  } catch (error) {
+-    console.error(`Failed to send lead ${lead.id} to n8n`, error);
+-  }
++  after(async () => {
++    try {
++      await callWebhook(
++        "lead-created",
++        {
++          leadId: lead.id,
++          fullName: lead.fullName,
++          email: lead.email,
++          phone: lead.phone,
++          company: lead.company,
++          budget: lead.budget,
++          message: lead.message,
++          source: lead.source,
++        },
++        { idempotencyKey: randomUUID(), correlationId: randomUUID() },
++      );
++    } catch (error) {
++      console.error(`Failed to send lead ${lead.id} to n8n`, error);
++    }
++  });
+ 
+   await logAudit("lead.created", lead.id);
+ 
+diff --git a/app/api/n8n/[event]/route.ts b/app/api/n8n/[event]/route.ts
+new file mode 100644
+index 0000000..d0511fe
+--- /dev/null
++++ b/app/api/n8n/[event]/route.ts
+@@ -0,0 +1,117 @@
++import { createHmac, timingSafeEqual } from "node:crypto";
++import { after } from "next/server";
++import { db } from "@/lib/db";
++import { logAudit } from "@/lib/audit";
++
++// Callback contract: .claude/skills/integrating-n8n-webhooks/references/callback-processing.md
++// Maps the public path segment to the `event` value n8n's callback body must carry.
++const EXPECTED_BODY_EVENT: Record<string, string> = {
++  "quote-request": "quote-request.completed",
++};
++
++const MAX_BODY_BYTES = 64 * 1024;
++const TIMESTAMP_WINDOW_SECONDS = 300;
++
++export async function POST(request: Request, { params }: RouteContext<"/api/n8n/[event]">) {
++  const { event } = await params;
++  const expectedBodyEvent = EXPECTED_BODY_EVENT[event];
++  if (!expectedBodyEvent) {
++    return Response.json({ error: "unknown event" }, { status: 404 });
++  }
++  if (request.headers.get("content-type") !== "application/json") {
++    return Response.json({ error: "unsupported media type" }, { status: 415 });
++  }
++
++  const raw = await request.text();
++  if (Buffer.byteLength(raw, "utf8") > MAX_BODY_BYTES) {
++    return Response.json({ error: "payload too large" }, { status: 413 });
++  }
++
++  const timestampHeader = request.headers.get("x-n8n-timestamp") ?? "";
++  const timestamp = Number(timestampHeader);
++  const nowSeconds = Date.now() / 1000;
++  if (!Number.isFinite(timestamp) || Math.abs(nowSeconds - timestamp) > TIMESTAMP_WINDOW_SECONDS) {
++    return Response.json({ error: "unauthorized" }, { status: 401 });
++  }
++
++  // Bytes of the provided vs. expected signature header. Compared for equal length before
++  // timingSafeEqual, which throws on a length mismatch instead of reporting one.
++  const providedBytes = Buffer.from(request.headers.get("x-n8n-signature") ?? "", "utf8");
++  const computedDigest = createHmac("sha256", process.env.N8N_CALLBACK_SECRET ?? "")
++    .update(`${timestampHeader}.${raw}`)
++    .digest("hex");
++  const expectedBytes = Buffer.from(`sha256=${computedDigest}`, "utf8");
++  const sameLength = providedBytes.length === expectedBytes.length;
++  if (!sameLength || !timingSafeEqual(providedBytes, expectedBytes)) {
++    return Response.json({ error: "unauthorized" }, { status: 401 });
++  }
++
++  const idempotencyHeader = request.headers.get("idempotency-key") ?? "";
++  const claimed = await db.claimCallbackKey(idempotencyHeader);
++  if (!claimed) {
++    return Response.json({ duplicate: true }, { status: 200 });
++  }
++
++  const parsed = parseCallbackBody(raw);
++  const bodyMatchesPath =
++    parsed !== null &&
++    parsed.event === expectedBodyEvent &&
++    idempotencyHeader === `${parsed.data.jobId}:${parsed.event}`;
++
++  if (!bodyMatchesPath) {
++    await db.releaseCallbackKey(idempotencyHeader);
++    return Response.json({ error: "invalid body" }, { status: 400 });
++  }
++
++  const quote = await db.getQuoteRequestByIdempotencyKey(parsed.data.requestIdempotencyKey);
++  if (!quote) {
++    await db.releaseCallbackKey(idempotencyHeader);
++    return Response.json({ error: "unknown request" }, { status: 400 });
++  }
++
++  const saved =
++    parsed.data.status === "completed"
++      ? await db.markQuoteRequestReady(quote.id, parsed.data.result?.documentUrl ?? "")
++      : await db.markQuoteRequestFailed(quote.id, parsed.data.error?.code ?? "workflow_failed");
++
++  if (!saved) {
++    await db.releaseCallbackKey(idempotencyHeader);
++    return Response.json({ error: "storage error" }, { status: 500 });
++  }
++
++  after(() => logAudit(`quote.${parsed.data.status}`, quote.id));
++
++  return Response.json({ ok: true }, { status: 202 });
++}
++
++type CallbackBody = {
++  event: string;
++  data: {
++    jobId: string;
++    status: "completed" | "failed";
++    requestIdempotencyKey: string;
++    result?: { documentUrl?: string };
++    error?: { code?: string };
++  };
++};
++
++function parseCallbackBody(raw: string): CallbackBody | null {
++  let payload: unknown;
++  try {
++    payload = JSON.parse(raw);
++  } catch {
++    return null;
++  }
++
++  if (typeof payload !== "object" || payload === null) return null;
++  const body = payload as Record<string, unknown>;
++  if (typeof body.event !== "string") return null;
++
++  const data = body.data;
++  if (typeof data !== "object" || data === null) return null;
++  const d = data as Record<string, unknown>;
++  if (typeof d.jobId !== "string" || typeof d.requestIdempotencyKey !== "string") return null;
++  if (d.status !== "completed" && d.status !== "failed") return null;
++
++  return { event: body.event, data: d as CallbackBody["data"] };
++}
+diff --git a/app/quotes/[id]/page.tsx b/app/quotes/[id]/page.tsx
+new file mode 100644
+index 0000000..03f7d37
+--- /dev/null
++++ b/app/quotes/[id]/page.tsx
+@@ -0,0 +1,97 @@
++import Link from "next/link";
++import { notFound } from "next/navigation";
++import { QuoteStatusBadge } from "@/components/quote-status-badge";
++import { QuoteStatusPoller } from "@/components/quote-status-poller";
++import { getQuoteRequest } from "@/lib/data";
++
++const dateTimeFormat = new Intl.DateTimeFormat("uk-UA", { dateStyle: "medium", timeStyle: "short" });
++const usd = new Intl.NumberFormat("uk-UA", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
++
++export default async function QuoteRequestPage({ params }: PageProps<"/quotes/[id]">) {
++  const { id } = await params;
++  const quote = await getQuoteRequest(id);
++
++  if (!quote) notFound();
++
++  return (
++    <div className="flex flex-1 flex-col">
++      <header className="border-b border-slate-200 bg-white">
++        <div className="mx-auto flex max-w-3xl items-center justify-between px-6 py-4">
++          <Link href="/" className="text-lg font-semibold tracking-tight">
++            Studio Nova
++          </Link>
++          <Link href="/quotes/new" className="text-sm text-slate-500 hover:text-slate-900">
++            Новий запит
++          </Link>
++        </div>
++      </header>
++
++      <main className="mx-auto w-full max-w-3xl flex-1 space-y-6 px-6 py-12">
++        <QuoteStatusPoller status={quote.status} />
++
++        <div className="flex items-start justify-between gap-4">
++          <div>
++            <h1 className="text-2xl font-semibold tracking-tight">Запит на кошторис</h1>
++            <p className="text-sm text-slate-500">{quote.id}</p>
++          </div>
++          <QuoteStatusBadge status={quote.status} />
++        </div>
++
++        {quote.status === "queued" && (
++          <section className="space-y-2 rounded-lg border border-sky-200 bg-sky-50 p-5 text-sm text-sky-900">
++            <p className="font-medium">Готуємо кошторис…</p>
++            <p>
++              Зазвичай це займає 40–90 секунд. Сторінка оновиться сама, можна її не перезавантажувати
++              вручну.
++            </p>
++          </section>
++        )}
++
++        {quote.status === "ready" && quote.documentUrl && (
++          <section className="space-y-3 rounded-lg border border-emerald-200 bg-emerald-50 p-5 text-sm text-emerald-900">
++            <p className="font-medium">Кошторис готовий</p>
++            <a
++              href={quote.documentUrl}
++              target="_blank"
++              rel="noopener noreferrer"
++              className="inline-flex rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700"
++            >
++              Завантажити кошторис (PDF)
++            </a>
++          </section>
++        )}
++
++        {quote.status === "failed" && (
++          <section className="space-y-2 rounded-lg border border-red-200 bg-red-50 p-5 text-sm text-red-900">
++            <p className="font-medium">Не вдалося підготувати кошторис</p>
++            <p>Спробуйте надіслати запит ще раз або напишіть нам напряму.</p>
++          </section>
++        )}
++
++        <dl className="grid grid-cols-1 gap-x-6 gap-y-3 rounded-lg border border-slate-200 bg-white p-5 text-sm sm:grid-cols-2">
++          <div>
++            <dt className="text-slate-500">Компанія</dt>
++            <dd className="font-medium break-words">{quote.company}</dd>
++          </div>
++          <div>
++            <dt className="text-slate-500">Email</dt>
++            <dd className="font-medium break-words">{quote.email}</dd>
++          </div>
++          <div>
++            <dt className="text-slate-500">Бюджет</dt>
++            <dd className="font-medium">{quote.budget === null ? "—" : usd.format(quote.budget)}</dd>
++          </div>
++          <div>
++            <dt className="text-slate-500">Створено</dt>
++            <dd className="font-medium">{dateTimeFormat.format(new Date(quote.createdAt))}</dd>
++          </div>
++        </dl>
++
++        <section className="space-y-2 rounded-lg border border-slate-200 bg-white p-5 text-sm">
++          <h2 className="font-medium">Опис задачі</h2>
++          <p className="whitespace-pre-line text-slate-700">{quote.taskDescription}</p>
++        </section>
++      </main>
++    </div>
++  );
++}
+diff --git a/app/quotes/actions.ts b/app/quotes/actions.ts
+new file mode 100644
+index 0000000..a8e8b17
+--- /dev/null
++++ b/app/quotes/actions.ts
+@@ -0,0 +1,59 @@
++"use server";
++
++import { randomUUID } from "node:crypto";
++import { redirect } from "next/navigation";
++import { after } from "next/server";
++import { db } from "@/lib/db";
++import { logAudit } from "@/lib/audit";
++import { callWebhook } from "@/lib/n8n/client";
++import { parseQuoteForm, type QuoteFormField } from "@/lib/quote-form";
++
++export type SubmitQuoteRequestState =
++  | { status: "idle" }
++  | { status: "invalid"; errors: Partial<Record<QuoteFormField, string>> };
++
++export async function submitQuoteRequest(
++  _prevState: SubmitQuoteRequestState,
++  formData: FormData,
++): Promise<SubmitQuoteRequestState> {
++  const parsed = parseQuoteForm(formData);
++  if (!parsed.ok) {
++    return { status: "invalid", errors: parsed.errors };
++  }
++
++  const idempotencyKey = randomUUID();
++  const correlationId = randomUUID();
++
++  const quote = await db.insertQuoteRequest({
++    ...parsed.data,
++    idempotencyKey,
++    correlationId,
++  });
++
++  after(async () => {
++    try {
++      const { ok } = await callWebhook(
++        "quote-request",
++        {
++          quoteId: quote.id,
++          company: quote.company,
++          email: quote.email,
++          taskDescription: quote.taskDescription,
++          budget: quote.budget,
++        },
++        {
++          idempotencyKey,
++          correlationId,
++          callbackUrl: `${process.env.APP_BASE_URL}/api/n8n/quote-request`,
++        },
++      );
++      if (!ok) await db.markQuoteRequestFailed(quote.id, "n8n_rejected");
++    } catch (error) {
++      console.error(`Failed to start quote-request workflow for ${quote.id}`, error);
++      await db.markQuoteRequestFailed(quote.id, "n8n_unreachable");
++    }
++  });
++
++  await logAudit("quote.created", quote.id);
++  redirect(`/quotes/${quote.id}`);
++}
+diff --git a/app/quotes/new/page.tsx b/app/quotes/new/page.tsx
+new file mode 100644
+index 0000000..320e0cd
+--- /dev/null
++++ b/app/quotes/new/page.tsx
+@@ -0,0 +1,38 @@
++import Link from "next/link";
++import { QuoteForm } from "@/components/quote-form";
++
++export default function NewQuotePage() {
++  return (
++    <div className="flex flex-1 flex-col">
++      <header className="border-b border-slate-200 bg-white">
++        <div className="mx-auto flex max-w-5xl items-center justify-between px-6 py-4">
++          <Link href="/" className="text-lg font-semibold tracking-tight">
++            Studio Nova
++          </Link>
++          <Link href="/login" className="text-sm text-slate-500 hover:text-slate-900">
++            Вхід для команди
++          </Link>
++        </div>
++      </header>
++
++      <main className="mx-auto grid w-full max-w-5xl flex-1 gap-10 px-6 py-12 md:grid-cols-[1fr_1.2fr]">
++        <section className="space-y-4">
++          <h1 className="text-3xl font-semibold tracking-tight">Запит на кошторис</h1>
++          <p className="text-slate-600">
++            Розкажіть коротко про задачу — ми підготуємо PDF-кошторис і надішлемо посилання на
++            нього на цій сторінці.
++          </p>
++          <ul className="space-y-2 text-sm text-slate-600">
++            <li>• Кошторис готується автоматично, зазвичай 40–90 секунд</li>
++            <li>• Сторінка запиту оновиться сама, коли він буде готовий</li>
++            <li>• Посилання на кошторис можна зберегти й переглянути пізніше</li>
++          </ul>
++        </section>
++
++        <section className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
++          <QuoteForm />
++        </section>
++      </main>
++    </div>
++  );
++}
+diff --git a/components/quote-form.tsx b/components/quote-form.tsx
+new file mode 100644
+index 0000000..8a64625
+--- /dev/null
++++ b/components/quote-form.tsx
+@@ -0,0 +1,59 @@
++"use client";
++
++import { useActionState } from "react";
++import { submitQuoteRequest, type SubmitQuoteRequestState } from "@/app/quotes/actions";
++import { QUOTE_BUDGET_OPTIONS } from "@/lib/quote-form";
++
++const initialState: SubmitQuoteRequestState = { status: "idle" };
++
++const inputClass =
++  "mt-1 block w-full rounded-md border border-slate-300 px-3 py-2 text-sm shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500";
++
++export function QuoteForm() {
++  const [state, formAction, pending] = useActionState(submitQuoteRequest, initialState);
++  const errors = state.status === "invalid" ? state.errors : {};
++
++  return (
++    <form action={formAction} className="space-y-4" noValidate>
++      <label className="block text-sm font-medium">
++        Компанія
++        <input name="company" autoComplete="organization" className={inputClass} />
++        {errors.company && <span className="mt-1 block text-xs text-red-600">{errors.company}</span>}
++      </label>
++
++      <label className="block text-sm font-medium">
++        Email
++        <input name="email" type="email" autoComplete="email" className={inputClass} />
++        {errors.email && <span className="mt-1 block text-xs text-red-600">{errors.email}</span>}
++      </label>
++
++      <label className="block text-sm font-medium">
++        Опис задачі
++        <textarea name="taskDescription" rows={4} className={inputClass} />
++        {errors.taskDescription && (
++          <span className="mt-1 block text-xs text-red-600">{errors.taskDescription}</span>
++        )}
++      </label>
++
++      <label className="block text-sm font-medium">
++        Бюджет
++        <select name="budget" defaultValue="" className={inputClass}>
++          {QUOTE_BUDGET_OPTIONS.map((option) => (
++            <option key={option.value} value={option.value}>
++              {option.label}
++            </option>
++          ))}
++        </select>
++        {errors.budget && <span className="mt-1 block text-xs text-red-600">{errors.budget}</span>}
++      </label>
++
++      <button
++        type="submit"
++        disabled={pending}
++        className="w-full rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-60"
++      >
++        {pending ? "Надсилаємо…" : "Надіслати запит на кошторис"}
++      </button>
++    </form>
++  );
++}
+diff --git a/components/quote-status-badge.tsx b/components/quote-status-badge.tsx
+new file mode 100644
+index 0000000..d368822
+--- /dev/null
++++ b/components/quote-status-badge.tsx
+@@ -0,0 +1,23 @@
++import type { QuoteStatus } from "@/lib/types";
++
++const QUOTE_STATUS_LABELS: Record<QuoteStatus, string> = {
++  queued: "Готується",
++  ready: "Готово",
++  failed: "Помилка",
++};
++
++const QUOTE_STATUS_STYLES: Record<QuoteStatus, string> = {
++  queued: "bg-sky-50 text-sky-700 ring-sky-200",
++  ready: "bg-emerald-50 text-emerald-700 ring-emerald-200",
++  failed: "bg-red-50 text-red-700 ring-red-200",
++};
++
++export function QuoteStatusBadge({ status }: { status: QuoteStatus }) {
++  return (
++    <span
++      className={`inline-flex rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${QUOTE_STATUS_STYLES[status]}`}
++    >
++      {QUOTE_STATUS_LABELS[status]}
++    </span>
++  );
++}
+diff --git a/components/quote-status-poller.tsx b/components/quote-status-poller.tsx
+new file mode 100644
+index 0000000..b27b4f4
+--- /dev/null
++++ b/components/quote-status-poller.tsx
+@@ -0,0 +1,19 @@
++"use client";
++
++import { useEffect } from "react";
++import { useRouter } from "next/navigation";
++import type { QuoteStatus } from "@/lib/types";
++
++const POLL_INTERVAL_MS = 5000;
++
++export function QuoteStatusPoller({ status }: { status: QuoteStatus }) {
++  const router = useRouter();
++
++  useEffect(() => {
++    if (status !== "queued") return;
++    const interval = setInterval(() => router.refresh(), POLL_INTERVAL_MS);
++    return () => clearInterval(interval);
++  }, [status, router]);
++
++  return null;
++}
+diff --git a/lib/audit.ts b/lib/audit.ts
+index 824fc0c..40b890c 100644
+--- a/lib/audit.ts
++++ b/lib/audit.ts
+@@ -1,5 +1,5 @@
+ import { db } from "./db";
+ 
+-export async function logAudit(action: string, leadId: string) {
+-  await db.insertAuditEntry({ action, leadId, at: new Date().toISOString() });
++export async function logAudit(action: string, entityId: string) {
++  await db.insertAuditEntry({ action, entityId, at: new Date().toISOString() });
+ }
+diff --git a/lib/data.ts b/lib/data.ts
+index 1b9dea5..668339b 100644
+--- a/lib/data.ts
++++ b/lib/data.ts
+@@ -36,3 +36,7 @@ export async function getSourceBreakdown(workspaceId: string) {
+ export async function getLead(id: string) {
+   return db.getLead(id);
+ }
++
++export async function getQuoteRequest(id: string) {
++  return db.getQuoteRequest(id);
++}
+diff --git a/lib/db.ts b/lib/db.ts
+index dace5aa..bf154de 100644
+--- a/lib/db.ts
++++ b/lib/db.ts
+@@ -5,6 +5,8 @@ import type {
+   LeadStats,
+   LeadStatus,
+   NewLead,
++  NewQuoteRequest,
++  QuoteRequest,
+   SourceCount,
+   User,
+   Workspace,
+@@ -20,6 +22,9 @@ type Store = {
+   leads: Lead[];
+   audit: AuditEntry[];
+   nextLeadNumber: number;
++  quoteRequests: QuoteRequest[];
++  nextQuoteNumber: number;
++  n8nCallbackClaims: Set<string>;
+ };
+ 
+ const LATENCY_MS = {
+@@ -36,6 +41,13 @@ const LATENCY_MS = {
+   insertAuditEntry: 250,
+   listUsers: 50,
+   createSession: 50,
++  insertQuoteRequest: 120,
++  getQuoteRequest: 80,
++  getQuoteRequestByIdempotencyKey: 80,
++  markQuoteRequestReady: 80,
++  markQuoteRequestFailed: 80,
++  claimCallbackKey: 50,
++  releaseCallbackKey: 50,
+ } as const;
+ 
+ type QueryName = keyof typeof LATENCY_MS;
+@@ -162,6 +174,10 @@ function leadId(n: number) {
+   return `lead_${String(n).padStart(4, "0")}`;
+ }
+ 
++function quoteId(n: number) {
++  return `quote_${String(n).padStart(4, "0")}`;
++}
++
+ function seedLeads(count: number, workspaces: Workspace[], users: User[]): Lead[] {
+   const random = mulberry32(20260921);
+   const pick = <T,>(items: readonly T[]) => items[Math.floor(random() * items.length)];
+@@ -262,7 +278,16 @@ function createStore(): Store {
+     { id: "u_marta", name: "Marta Novak", email: "marta@brightline.example.test", role: "manager", workspaceSlug: "brightline" },
+   ];
+   const leads = seedLeads(200, workspaces, users);
+-  return { workspaces, users, leads, audit: [], nextLeadNumber: leads.length + 1 };
++  return {
++    workspaces,
++    users,
++    leads,
++    audit: [],
++    nextLeadNumber: leads.length + 1,
++    quoteRequests: [],
++    nextQuoteNumber: 1,
++    n8nCallbackClaims: new Set(),
++  };
+ }
+ 
+ // One store per server process (also survives module reloads in `next dev`).
+@@ -394,4 +419,71 @@ export const db = {
+       store.audit.push(entry);
+     });
+   },
++
++  insertQuoteRequest(input: NewQuoteRequest) {
++    return query("insertQuoteRequest", (): QuoteRequest => {
++      const now = new Date().toISOString();
++      const quote: QuoteRequest = {
++        ...input,
++        id: quoteId(store.nextQuoteNumber++),
++        status: "queued",
++        documentUrl: null,
++        errorCode: null,
++        createdAt: now,
++        updatedAt: now,
++      };
++      store.quoteRequests.push(quote);
++      return structuredClone(quote);
++    });
++  },
++
++  getQuoteRequest(id: string) {
++    return query("getQuoteRequest", () => {
++      const quote = store.quoteRequests.find((q) => q.id === id);
++      return quote ? structuredClone(quote) : null;
++    });
++  },
++
++  getQuoteRequestByIdempotencyKey(idempotencyKey: string) {
++    return query("getQuoteRequestByIdempotencyKey", () => {
++      const quote = store.quoteRequests.find((q) => q.idempotencyKey === idempotencyKey);
++      return quote ? structuredClone(quote) : null;
++    });
++  },
++
++  markQuoteRequestReady(id: string, documentUrl: string) {
++    return query("markQuoteRequestReady", () => {
++      const quote = store.quoteRequests.find((q) => q.id === id);
++      if (!quote) return false;
++      quote.status = "ready";
++      quote.documentUrl = documentUrl;
++      quote.updatedAt = new Date().toISOString();
++      return true;
++    });
++  },
++
++  markQuoteRequestFailed(id: string, errorCode: string) {
++    return query("markQuoteRequestFailed", () => {
++      const quote = store.quoteRequests.find((q) => q.id === id);
++      if (!quote) return false;
++      quote.status = "failed";
++      quote.errorCode = errorCode;
++      quote.updatedAt = new Date().toISOString();
++      return true;
++    });
++  },
++
++  claimCallbackKey(key: string) {
++    return query("claimCallbackKey", () => {
++      if (store.n8nCallbackClaims.has(key)) return false;
++      store.n8nCallbackClaims.add(key);
++      return true;
++    });
++  },
++
++  releaseCallbackKey(key: string) {
++    return query("releaseCallbackKey", () => {
++      store.n8nCallbackClaims.delete(key);
++    });
++  },
+ };
+diff --git a/lib/n8n/client.ts b/lib/n8n/client.ts
+new file mode 100644
+index 0000000..f21a4fc
+--- /dev/null
++++ b/lib/n8n/client.ts
+@@ -0,0 +1,68 @@
++import "server-only";
++
++// Single module allowed to call the client's n8n webhooks (see
++// .claude/skills/integrating-n8n-webhooks/references/contract.md).
++
++export type WebhookEvent = "lead-created" | "quote-request";
++
++type CallWebhookOptions = {
++  idempotencyKey: string;
++  correlationId: string;
++  callbackUrl?: string;
++};
++
++type CallWebhookResult = { ok: boolean; status: number };
++
++const TIMEOUT_MS = 10_000;
++const RETRY_DELAYS_MS = [1_000, 3_000];
++
++function isRetryableStatus(status: number) {
++  return status >= 500 || status === 524;
++}
++
++async function postOnce(event: WebhookEvent, body: string, options: CallWebhookOptions) {
++  return fetch(`${process.env.N8N_WEBHOOK_BASE_URL}/${event}`, {
++    method: "POST",
++    signal: AbortSignal.timeout(TIMEOUT_MS),
++    headers: {
++      "content-type": "application/json",
++      "x-n8n-token": process.env.N8N_WEBHOOK_TOKEN ?? "",
++      "idempotency-key": options.idempotencyKey,
++      "x-correlation-id": options.correlationId,
++    },
++    body,
++  });
++}
++
++export async function callWebhook<T>(
++  event: WebhookEvent,
++  data: T,
++  options: CallWebhookOptions,
++): Promise<CallWebhookResult> {
++  const body = JSON.stringify({
++    version: 1,
++    event,
++    data,
++    ...(options.callbackUrl ? { callbackUrl: options.callbackUrl } : {}),
++  });
++
++  let lastStatus = 0;
++  const attempts = RETRY_DELAYS_MS.length + 1;
++
++  for (let attempt = 0; attempt < attempts; attempt++) {
++    try {
++      const response = await postOnce(event, body, options);
++      lastStatus = response.status;
++      if (response.ok || !isRetryableStatus(response.status)) {
++        return { ok: response.ok, status: response.status };
++      }
++    } catch (error) {
++      if (attempt === attempts - 1) throw error;
++    }
++    if (attempt < attempts - 1) {
++      await new Promise((resolve) => setTimeout(resolve, RETRY_DELAYS_MS[attempt]));
++    }
++  }
++
++  return { ok: false, status: lastStatus };
++}
+diff --git a/lib/quote-form.ts b/lib/quote-form.ts
+new file mode 100644
+index 0000000..a3ce754
+--- /dev/null
++++ b/lib/quote-form.ts
+@@ -0,0 +1,53 @@
++export const QUOTE_BUDGET_OPTIONS = [
++  { value: "", label: "Ще не визначились" },
++  { value: "500", label: "до $500" },
++  { value: "1500", label: "$500–1500" },
++  { value: "5000", label: "$1500–5000" },
++  { value: "10000", label: "понад $5000" },
++] as const;
++
++export type QuoteFormField = "company" | "email" | "taskDescription" | "budget";
++
++export type QuoteFormData = {
++  company: string;
++  email: string;
++  taskDescription: string;
++  budget: number | null;
++};
++
++export type QuoteParseResult =
++  | { ok: true; data: QuoteFormData }
++  | { ok: false; errors: Partial<Record<QuoteFormField, string>> };
++
++const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
++
++function text(formData: FormData, name: QuoteFormField, max = 200) {
++  const value = formData.get(name);
++  return typeof value === "string" ? value.trim().slice(0, max) : "";
++}
++
++export function parseQuoteForm(formData: FormData): QuoteParseResult {
++  const data: QuoteFormData = {
++    company: text(formData, "company", 120),
++    email: text(formData, "email", 200).toLowerCase(),
++    taskDescription: text(formData, "taskDescription", 2000),
++    budget: null,
++  };
++
++  const errors: Partial<Record<QuoteFormField, string>> = {};
++
++  if (!data.company) errors.company = "Вкажіть назву компанії";
++  if (!EMAIL_RE.test(data.email)) errors.email = "Перевірте email";
++  if (data.taskDescription.length < 10) errors.taskDescription = "Опишіть задачу хоча б одним реченням";
++
++  const budget = text(formData, "budget", 10);
++  if (budget) {
++    if (!QUOTE_BUDGET_OPTIONS.some((option) => option.value === budget)) {
++      errors.budget = "Оберіть бюджет зі списку";
++    } else {
++      data.budget = Number(budget);
++    }
++  }
++
++  return Object.keys(errors).length > 0 ? { ok: false, errors } : { ok: true, data };
++}
+diff --git a/lib/types.ts b/lib/types.ts
+index 7803a22..6d0d51a 100644
+--- a/lib/types.ts
++++ b/lib/types.ts
+@@ -95,6 +95,34 @@ export type SourceCount = {
+ 
+ export type AuditEntry = {
+   action: string;
+-  leadId: string;
++  entityId: string;
+   at: string;
+ };
++
++export const QUOTE_STATUSES = ["queued", "ready", "failed"] as const;
++
++export type QuoteStatus = (typeof QUOTE_STATUSES)[number];
++
++export type QuoteRequest = {
++  id: string;
++  company: string;
++  email: string;
++  taskDescription: string;
++  budget: number | null;
++  status: QuoteStatus;
++  idempotencyKey: string;
++  correlationId: string;
++  documentUrl: string | null;
++  errorCode: string | null;
++  createdAt: string;
++  updatedAt: string;
++};
++
++export type NewQuoteRequest = {
++  company: string;
++  email: string;
++  taskDescription: string;
++  budget: number | null;
++  idempotencyKey: string;
++  correlationId: string;
++};
