@@ -100,10 +100,14 @@ type CallbackBody = {
   };
 };
 
-// Accepts http/https only -- rejects javascript:, data:, etc. before the value
-// is ever passed to markQuoteRequestReady and, from there, into an <a href>.
-function isHttpUrl(value: string | undefined): value is string {
-  if (!value) return false;
+// Accepts http/https strings only -- rejects javascript:, data:, etc., and rejects
+// non-string values outright (parseCallbackBody's `as CallbackBody["data"]` cast means
+// TypeScript's `string | undefined` here isn't actually verified at runtime -- e.g. an
+// array like ["https://x"] would otherwise sail through `new URL()` via implicit
+// coercion) before the value is ever passed to markQuoteRequestReady and, from there,
+// into an <a href>.
+function isHttpUrl(value: unknown): value is string {
+  if (typeof value !== "string" || !value) return false;
   try {
     const url = new URL(value);
     return url.protocol === "http:" || url.protocol === "https:";
