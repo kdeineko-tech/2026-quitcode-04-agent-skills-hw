@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type {
   AuditEntry,
   Lead,
@@ -23,7 +24,6 @@ type Store = {
   audit: AuditEntry[];
   nextLeadNumber: number;
   quoteRequests: QuoteRequest[];
-  nextQuoteNumber: number;
   n8nCallbackClaims: Set<string>;
 };
 
@@ -174,8 +174,11 @@ function leadId(n: number) {
   return `lead_${String(n).padStart(4, "0")}`;
 }
 
-function quoteId(n: number) {
-  return `quote_${String(n).padStart(4, "0")}`;
+// Unguessable on purpose: /quotes/[id] is a public page with no session check
+// (same as the public lead form), so the id itself is what keeps one request
+// from reading another's company/email/budget/task description.
+function quoteId() {
+  return `quote_${randomUUID()}`;
 }
 
 function seedLeads(count: number, workspaces: Workspace[], users: User[]): Lead[] {
@@ -285,7 +288,6 @@ function createStore(): Store {
     audit: [],
     nextLeadNumber: leads.length + 1,
     quoteRequests: [],
-    nextQuoteNumber: 1,
     n8nCallbackClaims: new Set(),
   };
 }
@@ -425,7 +427,7 @@ export const db = {
       const now = new Date().toISOString();
       const quote: QuoteRequest = {
         ...input,
-        id: quoteId(store.nextQuoteNumber++),
+        id: quoteId(),
         status: "queued",
         documentUrl: null,
         errorCode: null,

@@ -6,11 +6,11 @@ import { after } from "next/server";
 import { db } from "@/lib/db";
 import { logAudit } from "@/lib/audit";
 import { callWebhook } from "@/lib/n8n/client";
-import { parseQuoteForm, type QuoteFormField } from "@/lib/quote-form";
+import { parseQuoteForm, type QuoteFormField, type QuoteFormValues } from "@/lib/quote-form";
 
 export type SubmitQuoteRequestState =
   | { status: "idle" }
-  | { status: "invalid"; errors: Partial<Record<QuoteFormField, string>> };
+  | { status: "invalid"; errors: Partial<Record<QuoteFormField, string>>; values: QuoteFormValues };
 
 export async function submitQuoteRequest(
   _prevState: SubmitQuoteRequestState,
@@ -18,7 +18,7 @@ export async function submitQuoteRequest(
 ): Promise<SubmitQuoteRequestState> {
   const parsed = parseQuoteForm(formData);
   if (!parsed.ok) {
-    return { status: "invalid", errors: parsed.errors };
+    return { status: "invalid", errors: parsed.errors, values: parsed.values };
   }
 
   const idempotencyKey = randomUUID();

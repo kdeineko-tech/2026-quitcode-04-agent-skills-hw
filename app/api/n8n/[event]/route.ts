@@ -69,9 +69,14 @@ export async function POST(request: Request, { params }: RouteContext<"/api/n8n/
     return Response.json({ error: "unknown request" }, { status: 400 });
   }
 
+  if (parsed.data.status === "completed" && !isHttpUrl(parsed.data.result?.documentUrl)) {
+    await db.releaseCallbackKey(idempotencyHeader);
+    return Response.json({ error: "invalid body" }, { status: 400 });
+  }
+
   const saved =
     parsed.data.status === "completed"
-      ? await db.markQuoteRequestReady(quote.id, parsed.data.result?.documentUrl ?? "")
+      ? await db.markQuoteRequestReady(quote.id, parsed.data.result!.documentUrl!)
       : await db.markQuoteRequestFailed(quote.id, parsed.data.error?.code ?? "workflow_failed");
 
   if (!saved) {
@@ -94,6 +99,18 @@ type CallbackBody = {
     error?: { code?: string };
   };
 };
+
+// Accepts http/https only -- rejects javascript:, data:, etc. before the value
+// is ever passed to markQuoteRequestReady and, from there, into an <a href>.
+function isHttpUrl(value: string | undefined): value is string {
+  if (!value) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
 
 function parseCallbackBody(raw: string): CallbackBody | null {
   let payload: unknown;

@@ -15,9 +15,19 @@ export type QuoteFormData = {
   budget: number | null;
 };
 
+// Raw, as-typed field values (budget kept as the submitted string, even if it
+// doesn't match a valid option) -- for repopulating the form via defaultValue
+// after a validation error, per the building-client-form skill's contract.
+export type QuoteFormValues = {
+  company: string;
+  email: string;
+  taskDescription: string;
+  budget: string;
+};
+
 export type QuoteParseResult =
   | { ok: true; data: QuoteFormData }
-  | { ok: false; errors: Partial<Record<QuoteFormField, string>> };
+  | { ok: false; errors: Partial<Record<QuoteFormField, string>>; values: QuoteFormValues };
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -49,5 +59,12 @@ export function parseQuoteForm(formData: FormData): QuoteParseResult {
     }
   }
 
-  return Object.keys(errors).length > 0 ? { ok: false, errors } : { ok: true, data };
+  if (Object.keys(errors).length > 0) {
+    return {
+      ok: false,
+      errors,
+      values: { company: data.company, email: data.email, taskDescription: data.taskDescription, budget },
+    };
+  }
+  return { ok: true, data };
 }
