@@ -112,31 +112,76 @@
 Тут скіл лише пакують. Застосовує його агент у прогоні **B** (Task D) — доказ спрацювання, журнал
 мока й час відповіді форми — у `docs/ab-validation.md`.
 
-- Що лишили в `SKILL.md`, а що винесли в `references/` (і чому): <…>
-- Правила зупинки — перелік: <…>
-- SHA коміту зі скілом (BASE для Task D): <…>
-- Що скіл змінив у собі після прогонів (коміти й чому): <… або «нічого»>
+- Що лишили в `SKILL.md`, а що винесли в `references/` (і чому): у `SKILL.md` — лише те, що агент
+  має **зробити** одразу (стислий контракт: змінні середовища одним реченням, три головні правила
+  запиту до n8n, два найчастіше порушувані кроки колбеку — сирий підпис до `JSON.parse` і
+  застовплення ідемпотентності до відповіді), чекліст, правила зупинки, Verify. Деталі, які треба
+  лише за потреби (повний 10-кроковий порядок обробки колбеку, таблиця режимів n8n, покроковий опис
+  налаштування в редакторі n8n, розбіжності документації) — у п'ять файлів `references/*.md`, з
+  прямим посиланням на кожен із розділу «Файли скіла» в `SKILL.md`. Записку `materials/n8n-webhooks-brief.md`
+  не копіювали дослівно — переписали своїми словами, стисло.
+- Правила зупинки — перелік:
+  1. Тестовий URL (`/webhook-test/…`) з'являється поза власним `.env.local`.
+  2. Секрет (`N8N_WEBHOOK_TOKEN`, `N8N_CALLBACK_SECRET`) мав би потрапити в Client Component, лог
+     чи query string.
+  3. Воркфлоу невідомої тривалості (чи такий, що може наблизитись до 100с) довелось би чекати
+     синхронно, бо асинхронний варіант ще не готовий на боці n8n.
+
+  Жодне правило не має винятку «якщо задача цього потребує».
+- SHA коміту зі скілом (BASE для Task D): `96d7ec4` — «skills: add integrating-n8n-webhooks
+  (contract, references, scripts)». У ньому вже є виправлення Task A і всі три скіли; ні `/quotes`,
+  ні переробленого виклику n8n ще немає.
+- Що скіл змінив у собі після прогонів (коміти й чому): ще не застосовувався в Task D — заповнимо
+  після відповідних прогонів.
 
 **`check-contract.mjs` на коді `main`** (id + PASS/FAIL, код виходу):
 
 ```
-<вивід>
+C1 FAIL  no /webhook-test/ URL in code or .env.example
+     .env.example:6
+C2 PASS  no NEXT_PUBLIC_* env var name referencing N8N
+C3 FAIL  n8n webhook fetch() calls live only in lib/n8n/client.*
+     app/actions.ts:54
+C4 FAIL  n8n webhook fetch() calls have AbortSignal.timeout(...)
+     app/actions.ts:54
+C5 PASS  callback route verifies signature before JSON.parse
+C6 PASS  no === / !== comparison against a signature/token/secret
+C7 PASS  .env.example N8N secrets use change-me-... placeholders
+
+7 checks, 3 FAIL
+exit=1
 ```
 
-**За бажанням: що скрипт побачив на навмисно поганому коді** (яку перевірку ламали, що вона
-сказала). До рубрики це не входить, але бали знімає скрипт, який завжди PASS:
+Отримано прогоном на чистому `git archive main` (розпакованому поруч у `../leaddesk-main`), а не на
+робочій гілці — щоб перевірити саме код `main`, без виправлень Task A/B.
+
+**Що скрипт побачив на навмисно поганому коді** (перевірки C5/C6 не мали на `main` що бачити — там
+ще немає жодного колбек-роуту, тож їх перевірили окремо, на короткому фейковому
+`app/api/n8n/[event]/route.ts` у тимчасовій теці поза репозиторієм, видаленій одразу після):
 
 ```
-<вивід>
+C1 PASS  no /webhook-test/ URL in code or .env.example
+C2 PASS  no NEXT_PUBLIC_* env var name referencing N8N
+C3 PASS  n8n webhook fetch() calls live only in lib/n8n/client.*
+C4 PASS  n8n webhook fetch() calls have AbortSignal.timeout(...)
+C5 FAIL  callback route verifies signature before JSON.parse
+     app/api/n8n/[event]/route.ts:2
+C6 FAIL  no === / !== comparison against a signature/token/secret
+     app/api/n8n/[event]/route.ts:5
+C7 PASS  .env.example N8N secrets use change-me-... placeholders
+
+7 checks, 2 FAIL
+exit=1
 ```
 
-**`check-contract.mjs` на фінальному коді** (після перенесення прогону B — 0 FAIL):
+Разом усі 7 перевірок (C1–C7) підтверджено як справжні: п'ять із них ловлять реальні порушення на
+`main`, дві решти — на навмисно поганому коді. Жодна перевірка не є такою, що завжди PASS.
 
-```
-<вивід>
-```
+**`check-contract.mjs` на фінальному коді** (після перенесення прогону B — 0 FAIL): ще не
+застосовується — буде заповнено після Task D.
 
-**Додатково (за бажанням):** матриця колбеків (`send-signed-callback.mjs`): випадок → очікуваний код → отриманий код.
+**Додатково (за бажанням):** матриця колбеків (`send-signed-callback.mjs`) — не робили (необов'язковий
+бонус-скрипт).
 
 ## Task E3 (бонус) — ті самі скіли в Cursor
 
