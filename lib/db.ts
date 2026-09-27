@@ -31,6 +31,7 @@ const LATENCY_MS = {
   getLead: 80,
   insertLead: 120,
   updateLeadStatus: 80,
+  appendLeadNote: 80,
   deleteLead: 80,
   insertAuditEntry: 250,
   listUsers: 50,
@@ -364,6 +365,16 @@ export const db = {
       const lead = store.leads.find((l) => l.id === id);
       if (!lead) return false;
       lead.status = status;
+      lead.updatedAt = new Date().toISOString();
+      return true;
+    });
+  },
+
+  appendLeadNote(id: string, note: string) {
+    return query("appendLeadNote", () => {
+      const lead = store.leads.find((l) => l.id === id);
+      if (!lead) return false;
+      lead.internalNotes = lead.internalNotes ? `${lead.internalNotes}\n\n${note}` : note;
       lead.updatedAt = new Date().toISOString();
       return true;
     });

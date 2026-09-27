@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { LeadActions } from "@/components/lead-actions";
+import { LeadNoteForm } from "@/components/lead-note-form";
 import { StatusBadge } from "@/components/status-badge";
 import { getCurrentUser, getLead, getWorkspace } from "@/lib/data";
 
@@ -68,6 +69,8 @@ export default async function LeadPage({ params }: PageProps<"/dashboard/leads/[
       )}
 
       <LeadActions leadId={lead.id} status={lead.status} />
+
+      <LeadNoteForm leadId={lead.id} />
     </div>
   );
 }
